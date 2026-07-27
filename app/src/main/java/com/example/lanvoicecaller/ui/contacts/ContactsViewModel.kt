@@ -9,4 +9,6 @@ class ContactsViewModel(private val service: LanCallService) : ViewModel() {
     val peers: StateFlow<List<PeerDevice>> = service.peers
 
     fun callPeer(peer: PeerDevice) = service.callPeer(peer)
+
+    fun rescan() = service.forceRescan()
 }

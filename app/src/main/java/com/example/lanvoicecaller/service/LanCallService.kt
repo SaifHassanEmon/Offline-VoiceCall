@@ -16,6 +16,7 @@ import com.example.lanvoicecaller.data.model.CallState
 import com.example.lanvoicecaller.data.model.ChatMessage
 import com.example.lanvoicecaller.data.model.PeerDevice
 import com.example.lanvoicecaller.data.prefs.AppPreferences
+import com.example.lanvoicecaller.network.discovery.LanDiscoveryManager
 import com.example.lanvoicecaller.network.signaling.SignalingClient
 import com.example.lanvoicecaller.network.signaling.SignalingMessage
 import com.example.lanvoicecaller.network.signaling.SignalingServer
@@ -24,11 +25,7 @@ import com.example.lanvoicecaller.network.wifidirect.WifiDirectManager
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.flow.launchIn
-import kotlinx.coroutines.flow.onEach
+import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 import java.util.UUID
 
@@ -37,18 +34,9 @@ private const val NOTIF_ID = 1
 private const val SIGNALING_PORT = 8888
 
 /**
- * Foreground service keeping all network components alive without any router or internet.
+ * Foreground service keeping all network components alive.
  *
- * Uses Wi-Fi Direct (WifiP2pManager) for device discovery and direct P2P connection.
- * Bind to this service from UI to access [peers], [callState], and [messages].
- *
- * Wi-Fi Direct connection flow:
- *  1. Both phones run startDiscovery() → each sees the other in [peers]
- *  2. Caller taps "Call" → callPeer() → wifiDirectManager.connectTo() fires
- *  3. Wi-Fi Direct group forms: one phone = Group Owner (GO, IP 192.168.49.1), other = Client
- *  4. Client connects TCP to 192.168.49.1:8888, sends HELLO + CALL_INITIATE
- *  5. GO's SignalingServer receives the call → shows IncomingCallScreen
- *  6. WebRTC audio P2P begins over the Wi-Fi Direct virtual LAN
+ * Supports BOTH Wi-Fi Direct (direct P2P with no router) AND Local LAN/Hotspot (NSD + UDP broadcast).
  */
 class LanCallService : Service() {
 
@@ -63,22 +51,17 @@ class LanCallService : Service() {
         private set
 
     private lateinit var wifiDirectManager: WifiDirectManager
+    private lateinit var lanDiscoveryManager: LanDiscoveryManager
     private lateinit var signalingServer: SignalingServer
     private lateinit var webRtcManager: WebRtcManager
     private var signalingClient: SignalingClient? = null
 
-    // ── Wi-Fi Direct state ────────────────────────────────────────────────────
-
-    // Map of MAC address → WifiP2pDevice (for triggering connections)
+    // Map of MAC address -> WifiP2pDevice
     private val wifiDeviceMap = mutableMapOf<String, WifiP2pDevice>()
-
-    // Map of MAC address → resolved PeerDevice (after HELLO exchange)
     private val resolvedPeers = mutableMapOf<String, PeerDevice>()
 
     private var isP2pConnected = false
     private var amGroupOwner = false
-
-    // Stores a pending call/chat target set before Wi-Fi Direct finishes connecting
     private var pendingCallPeer: PeerDevice? = null
 
     // ── Public state ──────────────────────────────────────────────────────────
@@ -102,16 +85,24 @@ class LanCallService : Service() {
         createNotificationChannel()
         startForeground(NOTIF_ID, buildNotification("Searching for devices…"))
 
-        // Wi-Fi Direct
+        // Wi-Fi Direct setup
         wifiDirectManager = WifiDirectManager(this)
         registerReceiver(wifiDirectManager.broadcastReceiver, wifiDirectManager.intentFilter)
 
-        // Observe discovered devices → update peer list
-        wifiDirectManager.discoveredDevices.onEach { devices ->
+        // Local LAN / Hotspot discovery setup
+        lanDiscoveryManager = LanDiscoveryManager(
+            context = this,
+            deviceId = prefs.deviceId,
+            deviceName = prefs.displayName,
+            signalingPort = SIGNALING_PORT
+        )
+
+        // Combine Wi-Fi Direct peers & LAN/Hotspot discovered peers
+        combine(wifiDirectManager.discoveredDevices, lanDiscoveryManager.peers) { p2pDevices, lanPeers ->
             wifiDeviceMap.clear()
-            devices.forEach { wifiDeviceMap[it.deviceAddress] = it }
-            // Merge discovered devices with any already-resolved peers
-            val merged = devices.map { d ->
+            p2pDevices.forEach { wifiDeviceMap[it.deviceAddress] = it }
+
+            val p2pList = p2pDevices.map { d ->
                 resolvedPeers[d.deviceAddress] ?: PeerDevice(
                     id = d.deviceAddress,
                     name = d.deviceName,
@@ -119,10 +110,15 @@ class LanCallService : Service() {
                     port = SIGNALING_PORT
                 )
             }
-            _peers.value = merged
-        }.launchIn(scope)
 
-        // Observe Wi-Fi Direct connection state
+            // Deduplicate by device ID or name
+            val map = LinkedHashMap<String, PeerDevice>()
+            lanPeers.forEach { map[it.id] = it }
+            p2pList.forEach { if (!map.containsKey(it.id)) map[it.id] = it }
+            map.values.sortedBy { it.name }
+        }.onEach { _peers.value = it }.launchIn(scope)
+
+        // Observe Wi-Fi Direct P2P connection state
         wifiDirectManager.connectionInfo.onEach { info ->
             if (info != null && !isP2pConnected) {
                 isP2pConnected = true
@@ -130,10 +126,8 @@ class LanCallService : Service() {
                 updateNotification(if (amGroupOwner) "Ready — waiting for peer…" else "Connecting to peer…")
 
                 if (!amGroupOwner) {
-                    // We're the client: connect to Group Owner at 192.168.49.1
                     handleClientSideConnection(info.groupOwnerIp)
                 }
-                // Group Owner: SignalingServer handles the incoming TCP connection
             } else if (info == null && isP2pConnected) {
                 isP2pConnected = false
                 updateNotification("Searching for devices…")
@@ -148,8 +142,9 @@ class LanCallService : Service() {
         // Signaling server
         startSignalingServer()
 
-        // Start peer discovery
+        // Start discovery services
         wifiDirectManager.startDiscovery()
+        lanDiscoveryManager.start()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_STICKY
@@ -159,18 +154,19 @@ class LanCallService : Service() {
     override fun onDestroy() {
         wifiDirectManager.stopDiscovery()
         wifiDirectManager.disconnect()
+        lanDiscoveryManager.stop()
         runCatching { unregisterReceiver(wifiDirectManager.broadcastReceiver) }
         signalingServer.stop()
         webRtcManager.close()
         super.onDestroy()
     }
 
-    // ── Wi-Fi Direct client-side connection ───────────────────────────────────
+    fun forceRescan() {
+        wifiDirectManager.startDiscovery()
+    }
 
-    /**
-     * Called when we are the Wi-Fi Direct client (non-Group-Owner).
-     * Connects to the Group Owner's TCP server and sends HELLO + any pending action.
-     */
+    // ── Client connection logic ───────────────────────────────────────────────
+
     private fun handleClientSideConnection(groupOwnerIp: String) {
         scope.launch {
             val client = SignalingClient()
@@ -185,10 +181,8 @@ class LanCallService : Service() {
                 return@launch
             }
 
-            // Announce ourselves — GO now knows our app name + our IP (from socket)
             sendHello(client)
 
-            // Fire any pending call
             pendingCallPeer?.let { peer ->
                 val connectedPeer = peer.copy(ipAddress = groupOwnerIp)
                 activePeer = connectedPeer
@@ -229,18 +223,15 @@ class LanCallService : Service() {
             when (envelope.type) {
 
                 SignalingMessage.TYPE_HELLO -> {
-                    // Peer announced themselves → resolve their app name + IP
                     val hello = SignalingMessage.json.decodeFromString(
                         SignalingMessage.Hello.serializer(), envelope.payload
                     )
                     val resolved = PeerDevice(hello.deviceId, hello.deviceName, peerIp, SIGNALING_PORT)
-                    // Update resolvedPeers map (match by any known MAC or by sender name)
                     val macKey = wifiDeviceMap.entries.firstOrNull {
                         it.value.deviceName == envelope.senderName || resolvedPeers[it.key]?.id == hello.deviceId
                     }?.key
                     macKey?.let { resolvedPeers[it] = resolved }
 
-                    // Update live peer list
                     _peers.value = _peers.value.map { p ->
                         if (p.name == envelope.senderName || p.id == hello.deviceId) resolved else p
                     }
@@ -345,15 +336,20 @@ class LanCallService : Service() {
         }
     }
 
-    // ── Public actions (called from ViewModels) ────────────────────────────────
+    // ── Actions ───────────────────────────────────────────────────────────────
 
-    /**
-     * Call [peer]. If Wi-Fi Direct is not connected yet, initiates the P2P connection
-     * and stores [peer] as pending — the call fires automatically once connected.
-     */
     fun callPeer(peer: PeerDevice) {
-        if (isP2pConnected) {
-            // Already connected — dial directly
+        if (peer.ipAddress.isNotBlank()) {
+            // Direct LAN/Hotspot peer with known IP address
+            scope.launch {
+                activePeer = peer
+                ensureSignalingClient(peer.ipAddress)
+                webRtcManager.createPeerConnection()
+                webRtcManager.createOffer()
+                _callState.value = CallState.Calling(peer)
+                updateNotification("Calling ${peer.name}…")
+            }
+        } else if (isP2pConnected) {
             val targetIp = if (amGroupOwner) peer.ipAddress else "192.168.49.1"
             if (targetIp.isBlank()) return
             scope.launch {
@@ -365,7 +361,7 @@ class LanCallService : Service() {
                 updateNotification("Calling ${peer.name}…")
             }
         } else {
-            // Trigger Wi-Fi Direct connection first; call fires in handleClientSideConnection
+            // Initiate Wi-Fi Direct connection
             pendingCallPeer = peer
             val device = wifiDeviceMap[peer.id]
             if (device != null) {
@@ -377,8 +373,7 @@ class LanCallService : Service() {
     fun acceptCall() {
         scope.launch {
             val peer = activePeer ?: return@launch
-            // If GO (server side), we need a client to reply to
-            val targetIp = if (amGroupOwner) peer.ipAddress else "192.168.49.1"
+            val targetIp = if (peer.ipAddress.isNotBlank()) peer.ipAddress else if (amGroupOwner) peer.ipAddress else "192.168.49.1"
             ensureSignalingClient(targetIp)
             webRtcManager.createAnswer()
             _callState.value = CallState.Active(peer)
@@ -427,9 +422,10 @@ class LanCallService : Service() {
             )
             _messages.value = _messages.value + msg
 
+            val targetIp = if (peer.ipAddress.isNotBlank()) peer.ipAddress else if (amGroupOwner) peer.ipAddress else "192.168.49.1"
+            if (targetIp.isBlank()) return@launch
+
             val client = signalingClient ?: run {
-                val targetIp = if (amGroupOwner) peer.ipAddress else "192.168.49.1"
-                if (targetIp.isBlank()) return@launch
                 ensureSignalingClient(targetIp)
                 signalingClient
             } ?: return@launch
@@ -471,7 +467,7 @@ class LanCallService : Service() {
     private fun createNotificationChannel() {
         val channel = NotificationChannel(
             CHANNEL_ID, "LAN Voice Caller", NotificationManager.IMPORTANCE_LOW
-        ).apply { description = "Wi-Fi Direct call activity" }
+        ).apply { description = "Voice call activity" }
         (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager)
             .createNotificationChannel(channel)
     }

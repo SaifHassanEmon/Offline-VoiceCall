@@ -2,7 +2,6 @@ package com.example.lanvoicecaller.ui.contacts
 
 import androidx.compose.animation.*
 import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -11,6 +10,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Call
 import androidx.compose.material.icons.filled.Chat
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -41,6 +41,11 @@ fun ContactsScreen(
                         Text("Signed in as $myName", style = MaterialTheme.typography.bodySmall, color = OnSurface)
                     }
                 },
+                actions = {
+                    IconButton(onClick = { viewModel.rescan() }) {
+                        Icon(Icons.Default.Refresh, contentDescription = "Refresh scan", tint = Violet80)
+                    }
+                },
                 colors = TopAppBarDefaults.topAppBarColors(containerColor = Background)
             )
         },
@@ -48,19 +53,30 @@ fun ContactsScreen(
     ) { paddingValues ->
         Box(Modifier.padding(paddingValues).fillMaxSize()) {
             if (peers.isEmpty()) {
-                EmptyState()
+                EmptyState(onRefresh = { viewModel.rescan() })
             } else {
                 LazyColumn(
                     contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp),
                     verticalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
                     item {
-                        Text(
-                            text = "${peers.size} online",
-                            style = MaterialTheme.typography.labelMedium,
-                            color = GreenOnline,
-                            modifier = Modifier.padding(vertical = 4.dp)
-                        )
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = "${peers.size} online",
+                                style = MaterialTheme.typography.labelMedium,
+                                color = GreenOnline,
+                                modifier = Modifier.padding(vertical = 4.dp)
+                            )
+                            Text(
+                                text = "Wi-Fi Direct / Local network",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = OnSurface
+                            )
+                        }
                     }
                     items(peers, key = { it.id }) { peer ->
                         AnimatedVisibility(
@@ -131,7 +147,7 @@ private fun PeerCard(
                             .background(GreenOnline)
                     )
                     Text(
-                        text = if (peer.ipAddress.isBlank()) "Wi-Fi Direct" else peer.ipAddress,
+                        text = if (peer.ipAddress.isBlank()) "Wi-Fi Direct P2P" else peer.ipAddress,
                         style = MaterialTheme.typography.bodySmall,
                         color = OnSurface
                     )
@@ -164,21 +180,44 @@ private fun PeerCard(
 }
 
 @Composable
-private fun EmptyState() {
+private fun EmptyState(onRefresh: () -> Unit) {
     Column(
-        modifier = Modifier.fillMaxSize(),
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(24.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center
     ) {
         Text("📡", style = MaterialTheme.typography.displayLarge)
         Spacer(Modifier.height(16.dp))
-        Text("Searching for devices…", style = MaterialTheme.typography.titleMedium, color = OnBg)
+        Text("Searching for nearby devices…", style = MaterialTheme.typography.titleMedium, color = OnBg)
         Spacer(Modifier.height(8.dp))
-        Text(
-            text = "Make sure Wi-Fi is on and the other\nphone has LAN Voice open nearby.",
-            style = MaterialTheme.typography.bodyMedium,
-            color = OnSurface,
-            textAlign = androidx.compose.ui.text.style.TextAlign.Center
-        )
+        
+        Card(
+            colors = CardDefaults.cardColors(containerColor = Surface),
+            shape = RoundedCornerShape(16.dp),
+            modifier = Modifier.fillMaxWidth().padding(vertical = 12.dp)
+        ) {
+            Column(
+                modifier = Modifier.padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Text("📌 Check these settings on BOTH phones:", style = MaterialTheme.typography.labelLarge, color = Violet100)
+                Text("1. Turn ON Location (GPS) in phone settings shade (required by Android for Wi-Fi Direct scanning).", style = MaterialTheme.typography.bodySmall, color = OnBg)
+                Text("2. Turn ON Wi-Fi on both phones.", style = MaterialTheme.typography.bodySmall, color = OnBg)
+                Text("3. Alternative: One phone turns on Hotspot (no internet needed) and the other phone connects to it.", style = MaterialTheme.typography.bodySmall, color = OnBg)
+            }
+        }
+
+        Button(
+            onClick = onRefresh,
+            colors = ButtonDefaults.buttonColors(containerColor = Violet100),
+            shape = RoundedCornerShape(12.dp),
+            modifier = Modifier.padding(top = 8.dp)
+        ) {
+            Icon(Icons.Default.Refresh, contentDescription = null)
+            Spacer(Modifier.width(8.dp))
+            Text("Tap to Rescan", color = OnBg)
+        }
     }
 }

@@ -10,6 +10,7 @@ import android.net.wifi.p2p.WifiP2pConfig
 import android.net.wifi.p2p.WifiP2pDevice
 import android.net.wifi.p2p.WifiP2pManager
 import android.util.Log
+import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -20,20 +21,16 @@ private const val TAG = "WifiDirect"
  * Manages Wi-Fi Direct (WifiP2pManager) peer discovery and group formation.
  *
  * NO Wi-Fi router or internet required — two phones connect directly.
- *
- * Flow:
- *   1. [startDiscovery] → [discoveredDevices] fills with nearby phones
- *   2. [connectTo] a device → Wi-Fi Direct P2P group forms automatically
- *   3. [connectionInfo] fires with group owner IP + role
- *   4. Non-owner (client) connects TCP to GO at 192.168.49.1:8888
- *   5. Owner (server) listens on SignalingServer for incoming TCP from client
  */
-class WifiDirectManager(context: Context) {
+class WifiDirectManager(private val context: Context) {
 
-    private val manager: WifiP2pManager =
-        context.getSystemService(Context.WIFI_P2P_SERVICE) as WifiP2pManager
-    private val channel: WifiP2pManager.Channel =
-        manager.initialize(context, context.mainLooper, null)
+    private val manager: WifiP2pManager? =
+        context.getSystemService(Context.WIFI_P2P_SERVICE) as? WifiP2pManager
+    private val channel: WifiP2pManager.Channel? =
+        manager?.initialize(context, context.mainLooper, null)
+
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private var discoveryJob: Job? = null
 
     // ── Public state ─────────────────────────────────────────────────────────
 
@@ -44,6 +41,12 @@ class WifiDirectManager(context: Context) {
 
     private val _connectionInfo = MutableStateFlow<P2pConnectionInfo?>(null)
     val connectionInfo: StateFlow<P2pConnectionInfo?> = _connectionInfo.asStateFlow()
+
+    private val _isWifiP2pEnabled = MutableStateFlow(true)
+    val isWifiP2pEnabled: StateFlow<Boolean> = _isWifiP2pEnabled.asStateFlow()
+
+    private val _lastErrorCode = MutableStateFlow<Int?>(null)
+    val lastErrorCode: StateFlow<Int?> = _lastErrorCode.asStateFlow()
 
     // ── BroadcastReceiver ─────────────────────────────────────────────────────
 
@@ -58,10 +61,19 @@ class WifiDirectManager(context: Context) {
         override fun onReceive(ctx: Context, intent: Intent) {
             when (intent.action) {
 
+                WifiP2pManager.WIFI_P2P_STATE_CHANGED_ACTION -> {
+                    val state = intent.getIntExtra(WifiP2pManager.EXTRA_WIFI_STATE, -1)
+                    val enabled = (state == WifiP2pManager.WIFI_P2P_STATE_ENABLED)
+                    _isWifiP2pEnabled.value = enabled
+                    Log.d(TAG, "P2P State changed: enabled=$enabled")
+                    if (enabled) startDiscovery()
+                }
+
                 WifiP2pManager.WIFI_P2P_PEERS_CHANGED_ACTION -> {
-                    manager.requestPeers(channel) { peerList ->
-                        _discoveredDevices.value = peerList.deviceList.toList()
-                        Log.d(TAG, "Peers found: ${peerList.deviceList.size}")
+                    manager?.requestPeers(channel) { peerList ->
+                        val list = peerList?.deviceList?.toList() ?: emptyList()
+                        _discoveredDevices.value = list
+                        Log.d(TAG, "Peers discovered: ${list.size}")
                     }
                 }
 
@@ -71,8 +83,8 @@ class WifiDirectManager(context: Context) {
                         WifiP2pManager.EXTRA_NETWORK_INFO
                     )
                     if (networkInfo?.isConnected == true) {
-                        manager.requestConnectionInfo(channel) { info ->
-                            val ip = info.groupOwnerAddress?.hostAddress
+                        manager?.requestConnectionInfo(channel) { info ->
+                            val ip = info?.groupOwnerAddress?.hostAddress
                             if (ip != null) {
                                 val ci = P2pConnectionInfo(info.isGroupOwner, ip)
                                 _connectionInfo.value = ci
@@ -84,11 +96,6 @@ class WifiDirectManager(context: Context) {
                         Log.d(TAG, "P2P Disconnected")
                     }
                 }
-
-                WifiP2pManager.WIFI_P2P_STATE_CHANGED_ACTION -> {
-                    val state = intent.getIntExtra(WifiP2pManager.EXTRA_WIFI_STATE, -1)
-                    Log.d(TAG, "P2P state: $state")
-                }
             }
         }
     }
@@ -96,38 +103,75 @@ class WifiDirectManager(context: Context) {
     // ── Actions ───────────────────────────────────────────────────────────────
 
     fun startDiscovery() {
-        manager.discoverPeers(channel, object : WifiP2pManager.ActionListener {
-            override fun onSuccess() { Log.d(TAG, "Discovery started") }
-            override fun onFailure(r: Int) { Log.w(TAG, "Discovery failed: $r") }
-        })
+        discoveryJob?.cancel()
+        discoveryJob = scope.launch {
+            while (isActive) {
+                triggerSingleDiscovery()
+                delay(12000) // Re-trigger discovery every 12 seconds to keep scanning active
+            }
+        }
+    }
+
+    private fun triggerSingleDiscovery() {
+        try {
+            manager?.discoverPeers(channel, object : WifiP2pManager.ActionListener {
+                override fun onSuccess() {
+                    _lastErrorCode.value = null
+                    Log.d(TAG, "discoverPeers success")
+                }
+
+                override fun onFailure(reasonCode: Int) {
+                    _lastErrorCode.value = reasonCode
+                    Log.w(TAG, "discoverPeers failure code: $reasonCode")
+                }
+            })
+        } catch (e: SecurityException) {
+            Log.e(TAG, "SecurityException in discoverPeers (missing location permission or GPS off)", e)
+        }
     }
 
     fun stopDiscovery() {
-        manager.stopPeerDiscovery(channel, null)
+        discoveryJob?.cancel()
+        discoveryJob = null
+        try {
+            manager?.stopPeerDiscovery(channel, null)
+        } catch (e: Exception) {
+            Log.w(TAG, "Error stopping discovery", e)
+        }
     }
 
-    /**
-     * Initiate a Wi-Fi Direct connection to [device].
-     * Uses PBC (push-button configuration) so no PIN is needed.
-     */
     fun connectTo(device: WifiP2pDevice) {
         val config = WifiP2pConfig().apply {
             deviceAddress = device.deviceAddress
             wps.setup = WpsInfo.PBC
         }
-        manager.connect(channel, config, object : WifiP2pManager.ActionListener {
-            override fun onSuccess() { Log.d(TAG, "Connecting to ${device.deviceName}…") }
-            override fun onFailure(r: Int) { Log.w(TAG, "Connect failed: $r") }
-        })
+        try {
+            manager?.connect(channel, config, object : WifiP2pManager.ActionListener {
+                override fun onSuccess() {
+                    Log.d(TAG, "Connecting to ${device.deviceName} (${device.deviceAddress})…")
+                }
+                override fun onFailure(reasonCode: Int) {
+                    Log.w(TAG, "Connect failed: reason=$reasonCode")
+                }
+            })
+        } catch (e: SecurityException) {
+            Log.e(TAG, "SecurityException during connectTo", e)
+        }
     }
 
     fun disconnect() {
-        manager.removeGroup(channel, object : WifiP2pManager.ActionListener {
-            override fun onSuccess() {
-                _connectionInfo.value = null
-                _discoveredDevices.value = emptyList()
-            }
-            override fun onFailure(r: Int) { Log.w(TAG, "Disconnect failed: $r") }
-        })
+        try {
+            manager?.removeGroup(channel, object : WifiP2pManager.ActionListener {
+                override fun onSuccess() {
+                    _connectionInfo.value = null
+                    _discoveredDevices.value = emptyList()
+                }
+                override fun onFailure(reasonCode: Int) {
+                    Log.w(TAG, "Disconnect failed: $reasonCode")
+                }
+            })
+        } catch (e: Exception) {
+            Log.w(TAG, "Error removing group", e)
+        }
     }
 }
