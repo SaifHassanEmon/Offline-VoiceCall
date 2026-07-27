@@ -83,11 +83,19 @@ class LanCallService : Service() {
         super.onCreate()
         prefs = AppPreferences(this)
         createNotificationChannel()
-        startForeground(NOTIF_ID, buildNotification("Searching for devices…"))
+        startForegroundSafely("Searching for devices…")
 
         // Wi-Fi Direct setup
         wifiDirectManager = WifiDirectManager(this)
-        registerReceiver(wifiDirectManager.broadcastReceiver, wifiDirectManager.intentFilter)
+        try {
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
+                registerReceiver(wifiDirectManager.broadcastReceiver, wifiDirectManager.intentFilter, Context.RECEIVER_EXPORTED)
+            } else {
+                registerReceiver(wifiDirectManager.broadcastReceiver, wifiDirectManager.intentFilter)
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
 
         // Local LAN / Hotspot discovery setup
         lanDiscoveryManager = LanDiscoveryManager(
@@ -484,14 +492,34 @@ class LanCallService : Service() {
             .build()
     }
 
+    private fun startForegroundSafely(text: String) {
+        try {
+            val notification = buildNotification(text)
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+                startForeground(
+                    NOTIF_ID,
+                    notification,
+                    android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+                )
+            } else {
+                startForeground(NOTIF_ID, notification)
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+    }
+
     private fun updateNotification(text: String) {
-        (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager)
-            .notify(NOTIF_ID, buildNotification(text))
+        startForegroundSafely(text)
     }
 
     companion object {
         fun start(context: Context) {
-            context.startForegroundService(Intent(context, LanCallService::class.java))
+            try {
+                context.startForegroundService(Intent(context, LanCallService::class.java))
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
         }
     }
 }
