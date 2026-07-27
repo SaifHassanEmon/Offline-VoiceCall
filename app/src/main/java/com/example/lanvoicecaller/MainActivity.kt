@@ -9,6 +9,7 @@ import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
+import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -26,18 +27,21 @@ import com.example.lanvoicecaller.service.LanCallService
 import com.example.lanvoicecaller.theme.LANVoiceCallerTheme
 import com.example.lanvoicecaller.theme.Violet100
 
+private const val TAG = "MainActivity"
+
 class MainActivity : ComponentActivity() {
 
-    private var lanService: LanCallService? = null
-    private var serviceConnected by mutableStateOf(false)
+    private var lanService by mutableStateOf<LanCallService?>(null)
 
     private val connection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName, binder: IBinder) {
-            lanService = (binder as LanCallService.LocalBinder).getService()
-            serviceConnected = true
+            Log.d(TAG, "onServiceConnected successfully")
+            val service = (binder as LanCallService.LocalBinder).getService()
+            lanService = service
         }
         override fun onServiceDisconnected(name: ComponentName) {
-            serviceConnected = false
+            Log.d(TAG, "onServiceDisconnected")
+            lanService = null
         }
     }
 
@@ -51,11 +55,15 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
 
+        // Bind service immediately at launch
+        startAndBindService()
+
         setContent {
             LANVoiceCallerTheme {
                 Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
-                    if (serviceConnected && lanService != null) {
-                        MainNavigation(service = lanService!!)
+                    val currentService = lanService
+                    if (currentService != null) {
+                        MainNavigation(service = currentService)
                     } else {
                         Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                             CircularProgressIndicator(color = Violet100)
@@ -84,9 +92,7 @@ class MainActivity : ComponentActivity() {
             ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
         }
 
-        if (missing.isEmpty()) {
-            startAndBindService()
-        } else {
+        if (missing.isNotEmpty()) {
             permissionLauncher.launch(permissions.toTypedArray())
         }
     }
@@ -100,12 +106,12 @@ class MainActivity : ComponentActivity() {
                 Context.BIND_AUTO_CREATE
             )
         } catch (e: Exception) {
-            e.printStackTrace()
+            Log.e(TAG, "Error in startAndBindService", e)
         }
     }
 
     override fun onDestroy() {
         super.onDestroy()
-        if (serviceConnected) runCatching { unbindService(connection) }
+        if (lanService != null) runCatching { unbindService(connection) }
     }
 }

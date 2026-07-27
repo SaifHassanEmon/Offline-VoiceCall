@@ -144,15 +144,15 @@ class LanCallService : Service() {
 
         // WebRTC
         webRtcManager = WebRtcManager(this)
-        webRtcManager.init()
+        runCatching { webRtcManager.init() }
         setupWebRtcCallbacks()
 
         // Signaling server
-        startSignalingServer()
+        runCatching { startSignalingServer() }
 
         // Start discovery services
-        wifiDirectManager.startDiscovery()
-        lanDiscoveryManager.start()
+        runCatching { wifiDirectManager.startDiscovery() }
+        runCatching { lanDiscoveryManager.start() }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_STICKY
